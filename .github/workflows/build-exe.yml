@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  # 手动触发（推荐）或 push 时自动触发
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    # 关键：使用 Windows 虚拟机
+    runs-on: windows-latest
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. 安装 Python 3.10
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: |
+          pip install requests pandas numpy pyinstaller
+
+      # 4. 打包成 EXE
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --console --name okx_swing okx_swing.py
+
+      # 5. 上传生成的 EXE 文件
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx_swing-windows-exe
+          path: dist/okx_swing.exe
