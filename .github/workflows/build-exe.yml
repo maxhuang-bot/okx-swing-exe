@@ -1,67 +1,49 @@
-name: Build EXE for Windows
+name: Build Windows EXE
 
 on:
-  # 手动触发（推荐测试用）
+  # 手动触发（推荐）
   workflow_dispatch:
-  
-  # 或：推送到 main 分支时自动构建
+
+  # 可选：推送 main 分支时自动构建
   # push:
   #   branches: [ "main" ]
-  
-  # 或：发布新版本时构建（推荐用于正式版）
-  # release:
-  #   types: [ published ]
 
 jobs:
-  build-windows-exe:
-    runs-on: windows-latest  # 使用 GitHub 提供的 Windows 虚拟机
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.10"]
 
     steps:
-      # 1. 检出代码
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. 设置 Python 环境
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'  # 推荐固定版本
+          python-version: ${{ matrix.python-version }}
 
-      # 3. 安装依赖
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install flask flask-socketio requests pandas numpy pyinstaller
 
-      # 4. 打包成 EXE（关键步骤）
       - name: Build EXE with PyInstaller
         run: |
           pyinstaller --onefile --noconsole --name OKX_Swing_Scanner okx_swing.py
-
-      # 5. 创建分发目录（包含 exe + 说明）
-      - name: Prepare distribution folder
+      - name: Create distribution folder
         run: |
           mkdir dist\OKX_Swing_Scanner
           copy dist\OKX_Swing_Scanner.exe dist\OKX_Swing_Scanner\
-          echo "双击运行 OKX_Swing_Scanner.exe 后，自动打开浏览器访问 http://localhost:5000" > dist\OKX_Swing_Scanner\README.txt
+          echo Double-click to run. Visit http://localhost:5000 in your browser. > dist\OKX_Swing_Scanner\README.txt
 
-      # 6. 打包成 ZIP（方便下载）
       - name: Create ZIP archive
         run: |
           Compress-Archive -Path dist\OKX_Swing_Scanner -DestinationPath OKX_Swing_Scanner_Windows.zip
 
-      # 7. 上传为 Artifact（可在 Actions 页面下载）
-      - name: Upload artifact
+      - name: Upload as artifact
         uses: actions/upload-artifact@v4
         with:
           name: OKX_Swing_Scanner_Windows
           path: OKX_Swing_Scanner_Windows.zip
-
-      # （可选）8. 如果是 Release 触发，自动附加到 Release
-      # - name: Upload to Release
-      #   if: github.event_name == 'release'
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     files: OKX_Swing_Scanner_Windows.zip
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
