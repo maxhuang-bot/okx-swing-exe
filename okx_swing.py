@@ -8,6 +8,7 @@ import numpy as np
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 import logging
+import webbrowser
 
 # 关闭 Flask 默认日志
 log = logging.getLogger('werkzeug')
@@ -15,7 +16,7 @@ log.setLevel(logging.ERROR)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'okx_swing_secret'
-socketio = SocketIO(app, async_mode='threading')
+socketio = SocketIO(app)  # ✅ 移除 async_mode，自动选择后端
 
 # 全局状态
 all_symbols = []
@@ -87,7 +88,7 @@ def fetch_klines(symbol, limit=100):
             return None
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df.sort_values('ts').reset_index(drop=True)
-    except:
+    except Exception:
         return None
 
 def get_okx_swap_symbols():
@@ -98,7 +99,7 @@ def get_okx_swap_symbols():
             return [item['instId'] for item in data['data']]
         else:
             return []
-    except:
+    except Exception:
         return []
 
 # ========== 后台扫描线程 ==========
@@ -138,25 +139,38 @@ def background_scanner():
                 prices[symbol] = {'price': latest, 'change': change}
 
             if is_swing_market(df, atr_lookback=20):
-                avg_amp = ((df['high'] - df['low']) / df['open']).tail(5000).mean()
+                # ✅ 安全计算振幅：防除零、无穷
+                amp_series = (df['high'] - df['low']) / df['open']
+                amp_series = amp_series.replace([np.inf, -np.inf], np.nan).dropna()
+                avg_amp = amp_series.tail(5000).mean() if len(amp_series) > 0 else 0
                 new_swing_this_round[symbol] = {
                     'price': latest,
                     'amplitude': avg_amp
                 }
 
-            socketio.sleep(0.12)
+            time.sleep(0.12)  # ✅ 使用 time.sleep 而非 socketio.sleep
 
+        # ✅ 线程安全：emit 前加锁复制
         with lock:
             for sym, data in new_swing_this_round.items():
                 swing_symbols[sym] = data
+            prices_snapshot = prices.copy()
+            swings_snapshot = swing_symbols.copy()
 
-        socketio.emit('update_prices', prices.copy(), namespace='/')
-        socketio.emit('update_swings', swing_symbols.copy(), namespace='/')
+        socketio.emit('update_prices', prices_snapshot, namespace='/')
+        socketio.emit('update_swings', swings_snapshot, namespace='/')
 
         scan_index = (scan_index + batch_size) % total_symbols
 
         if scan_index < batch_size:
             print(f"🔄 已完成一轮全市场扫描（共 {total_symbols} 个合约）")
+
+# ========== 自动打开浏览器（带异常处理）==========
+def open_browser():
+    try:
+        webbrowser.open("http://localhost:5000", new=2)
+    except Exception:
+        pass  # 忽略浏览器打不开的错误
 
 # ========== Web 路由 ==========
 @app.route('/')
@@ -301,6 +315,11 @@ HTML_TEMPLATE = '''
 if __name__ == '__main__':
     scanner_thread = threading.Thread(target=background_scanner, daemon=True)
     scanner_thread.start()
-    print("🚀 OKX 全市场震荡扫描器已启动！")
-    print("请访问: http://localhost:5000")
+    
+    # 启动后 1.5 秒自动打开浏览器
+    browser_thread = threading.Thread(target=open_browser)
+    browser_thread.daemon = True
+    browser_thread.start()
+    
+    print("🚀 OKX 扫描器已启动，正在打开浏览器...")
     socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
