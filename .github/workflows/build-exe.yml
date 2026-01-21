@@ -36,7 +36,7 @@ jobs:
       # 4. 打包成 EXE（关键步骤）
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile --noconsole --name OKX_Swing_Scanner okx_swing_web_full.py
+          pyinstaller --onefile --noconsole --name OKX_Swing_Scanner okx_swing.py
 
       # 5. 创建分发目录（包含 exe + 说明）
       - name: Prepare distribution folder
