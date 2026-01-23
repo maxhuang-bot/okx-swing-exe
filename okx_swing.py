@@ -1,4 +1,4 @@
-# okx_swing_web_full.py
+# multi_exchange_swing_scanner.py
 import os
 import time
 import threading
@@ -15,18 +15,20 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'okx_swing_secret'
-socketio = SocketIO(app)  # ✅ 移除 async_mode，自动选择后端
+app.config['SECRET_KEY'] = 'multi_exchange_swing_secret'
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # 全局状态
+current_exchange = 'binance'  # 默认币安
 all_symbols = []
 prices = {}
 swing_symbols = {}
 scan_index = 0
 total_symbols = 0
 lock = threading.Lock()
+scanning = False
 
-# ========== 指标计算 ==========
+# ========== 技术指标计算 ==========
 def calculate_rsi(close, window=14):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
@@ -68,130 +70,269 @@ def is_swing_market(df, atr_lookback=20):
     cond3 = len(atr) >= atr_lookback and atr.iloc[-1] < atr.tail(atr_lookback).median()
     return cond1 and cond2 and cond3
 
+# ========== 交易所配置 ==========
+EXCHANGES = {
+    'binance': {
+        'name': 'Binance',
+        'color': '#f39c12',
+        'symbols_url': 'https://fapi.binance.com/fapi/v1/exchangeInfo',
+        'kline_url': 'https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=15m&limit={}',
+        'get_symbols': lambda data: sorted([
+            item['symbol'] for item in data.get('symbols', [])
+            if item.get('contractType') == 'PERPETUAL' and item.get('quoteAsset') == 'USDT'
+        ])
+    },
+    'okx': {
+        'name': 'OKX',
+        'color': '#4cc9f0',
+        'symbols_url': 'https://www.okx.com/api/v5/public/instruments?instType=SWAP',
+        'kline_url': 'https://www.okx.com/api/v5/market/candles?instId={}&bar=15m&limit={}',
+        'get_symbols': lambda data: [
+            item['instId'] for item in data.get('data', []) if item.get('ctType') == 'linear'
+        ]
+    },
+    'bybit': {
+        'name': 'Bybit',
+        'color': '#ff7326',
+        'symbols_url': 'https://api.bybit.com/derivatives/v3/public/instruments-info?category=linear',
+        'kline_url': 'https://api.bybit.com/derivatives/v3/public/kline?category=linear&symbol={}&interval=15&limit={}',
+        'get_symbols': lambda data: [
+            item['symbol'] for item in data.get('result', {}).get('list', [])
+            if item.get('status') == 'Trading'
+        ]
+    },
+    'bitget': {
+        'name': 'Bitget',
+        'color': '#00c1de',
+        'symbols_url': 'https://api.bitget.com/api/mix/v1/market/contracts?productType=usdt-futures',
+        'kline_url': 'https://api.bitget.com/api/mix/v1/market/candles?symbol={}&granularity=15m&limit={}',
+        'get_symbols': lambda data: [
+            item['symbol'] for item in data.get('data', []) if item.get('status') == 'online'
+        ]
+    },
+    'kucoin': {
+        'name': 'KuCoin Futures',
+        'color': '#fd8c3b',
+        'symbols_url': 'https://api-futures.kucoin.com/api/v1/contracts/active',
+        'kline_url': 'https://api-futures.kucoin.com/api/v1/kline?symbol={}&granularity=15&type=1&limit={}',
+        'get_symbols': lambda data: [
+            item['symbol'] for item in data.get('data', []) if item.get('status') == 'Open'
+        ]
+    }
+}
+
 # ========== 数据获取 ==========
-def fetch_klines(symbol, limit=100):
+def fetch_klines(exchange_id, symbol, limit=100):
     try:
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=15m&limit={limit}"
+        config = EXCHANGES[exchange_id]
+        url = config['kline_url'].format(symbol, limit)
         resp = requests.get(url, timeout=8)
         if resp.status_code != 200:
             return None
+        
         data = resp.json()
-        if data.get('code') != '0' or not data.get('data'):
+        
+        if exchange_id == 'binance':
+            if not isinstance(data, list):
+                return None
+            df = pd.DataFrame(data, columns=[
+                'open_time', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
+        elif exchange_id == 'okx':
+            if data.get('code') != '0' or not data.get('data'):
+                return None
+            df = pd.DataFrame(data['data'], columns=[
+                'ts', 'open', 'high', 'low', 'close', 'vol', 'volCcy', 'volCcyQuote', 'confirm'
+            ])
+            # 👇 关键修复：OKX 返回倒序，需反转为正序（最新在最后）
+            df = df.iloc[::-1].reset_index(drop=True)
+        elif exchange_id == 'bybit':
+            if data.get('retCode') != 0 or not data.get('result', {}).get('list'):
+                return None
+            klines = data['result']['list']
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        elif exchange_id == 'bitget':
+            if data.get('code') != '00000' or not data.get('data'):
+                return None
+            klines = data['data']
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        elif exchange_id == 'kucoin':
+            if data.get('code') != '200000' or not data.get('data'):
+                return None
+            klines = data['data']
+            df = pd.DataFrame(klines, columns=['time', 'open', 'close', 'high', 'low', 'volume'])
+            df = df[['time', 'open', 'high', 'low', 'close', 'volume']]
+        else:
             return None
-        df = pd.DataFrame(data['data'], columns=[
-            'ts', 'open', 'high', 'low', 'close', 'vol', 'volCcy', 'volCcyQuote', 'confirm'
-        ])
-        numeric_cols = ['ts', 'open', 'high', 'low', 'close']
+
+        numeric_cols = ['open', 'high', 'low', 'close']
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
         df.dropna(inplace=True)
         if len(df) == 0:
             return None
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        return df.sort_values('ts').reset_index(drop=True)
+        return df.reset_index(drop=True)
     except Exception:
         return None
 
-def get_okx_swap_symbols():
+def get_symbols(exchange_id):
     try:
-        resp = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", timeout=10)
+        config = EXCHANGES[exchange_id]
+        resp = requests.get(config['symbols_url'], timeout=10)
         data = resp.json()
-        if data['code'] == '0':
-            return [item['instId'] for item in data['data']]
-        else:
-            return []
+        symbols = config['get_symbols'](data)
+        return sorted(symbols)
     except Exception:
         return []
 
 # ========== 后台扫描线程 ==========
 def background_scanner():
-    global all_symbols, prices, swing_symbols, scan_index, total_symbols
-    symbols = get_okx_swap_symbols()
-    if not symbols:
-        print("❌ 无法获取合约列表")
-        return
-
-    with lock:
-        all_symbols = symbols
-        total_symbols = len(symbols)
-        for s in symbols:
-            prices[s] = {'price': '--', 'change': 0}
-
-    print(f"✅ 获取到 {total_symbols} 个永续合约，开始滚动扫描...")
-    
-    batch_size = 12
+    global current_exchange, all_symbols, prices, swing_symbols, scan_index, total_symbols, scanning
     while True:
-        start_idx = scan_index
-        end_idx = min(start_idx + batch_size, total_symbols)
-        current_batch = all_symbols[start_idx:end_idx]
+        with lock:
+            exchange = current_exchange
+            scanning = True
 
-        new_swing_this_round = {}
+        symbols = get_symbols(exchange)
+        if not symbols:
+            print(f"❌ 无法获取 {EXCHANGES[exchange]['name']} 合约列表")
+            time.sleep(10)
+            continue
 
-        for symbol in current_batch:
-            df = fetch_klines(symbol, limit=100)
-            if df is None or len(df) < 2:
-                continue
+        with lock:
+            all_symbols = symbols
+            total_symbols = len(symbols)
+            prices = {s: {'price': None, 'change': 0.0} for s in symbols}
+            swing_symbols = {}
 
-            latest = df['close'].iloc[-1]
-            prev = df['close'].iloc[-2]
-            change = ((latest - prev) / prev) * 100 if prev != 0 else 0
+        print(f"✅ {EXCHANGES[exchange]['name']}：获取到 {total_symbols} 个合约，开始滚动扫描...")
+        
+        batch_size = 12
+        scan_idx = 0
+        while scanning and current_exchange == exchange:
+            start_idx = scan_idx
+            end_idx = min(start_idx + batch_size, total_symbols)
+            current_batch = all_symbols[start_idx:end_idx]
+
+            new_swing_this_round = {}
+
+            for symbol in current_batch:
+                df = fetch_klines(exchange, symbol, limit=100)
+                if df is None or len(df) < 2:
+                    continue
+
+                latest = df['close'].iloc[-1]
+                prev = df['close'].iloc[-2]
+                change = ((latest - prev) / prev) * 100 if prev != 0 else 0.0
+
+                # 👇 关键修复：转换为原生 Python float，避免 JSON 序列化失败
+                safe_price = float(latest) if pd.notna(latest) else None
+                safe_change = float(change) if pd.notna(change) else 0.0
+
+                with lock:
+                    if symbol in prices:
+                        prices[symbol] = {'price': safe_price, 'change': safe_change}
+
+                if is_swing_market(df, atr_lookback=20):
+                    amp_series = (df['high'] - df['low']) / df['open']
+                    amp_series = amp_series.replace([np.inf, -np.inf], np.nan).dropna()
+                    avg_amp = amp_series.tail(5000).mean() if len(amp_series) > 0 else 0.0
+                    new_swing_this_round[symbol] = {
+                        'price': float(latest) if pd.notna(latest) else None,
+                        'amplitude': float(avg_amp) if pd.notna(avg_amp) else 0.0
+                    }
+
+                time.sleep(0.12)
+
+            # 👇 安全初始化快照变量（防止 UnboundLocalError）
+            prices_snapshot = {}
+            swings_snapshot = {}
+            exchange_name = EXCHANGES[exchange]['name']
+            color = EXCHANGES[exchange]['color']
 
             with lock:
-                prices[symbol] = {'price': latest, 'change': change}
+                if current_exchange == exchange:
+                    for sym, data in new_swing_this_round.items():
+                        swing_symbols[sym] = data
+                    prices_snapshot = prices.copy()
+                    swings_snapshot = swing_symbols.copy()
 
-            if is_swing_market(df, atr_lookback=20):
-                # ✅ 安全计算振幅：防除零、无穷
-                amp_series = (df['high'] - df['low']) / df['open']
-                amp_series = amp_series.replace([np.inf, -np.inf], np.nan).dropna()
-                avg_amp = amp_series.tail(5000).mean() if len(amp_series) > 0 else 0
-                new_swing_this_round[symbol] = {
-                    'price': latest,
-                    'amplitude': avg_amp
-                }
+            # 👇 安全 emit（现在所有值都是 JSON serializable）
+            socketio.emit('update_prices', prices_snapshot, namespace='/')
+            socketio.emit('update_swings', swings_snapshot, namespace='/')
+            socketio.emit('update_exchange', {'exchange': exchange_name, 'color': color}, namespace='/')
 
-            time.sleep(0.12)  # ✅ 使用 time.sleep 而非 socketio.sleep
+            scan_idx = (scan_idx + batch_size) % total_symbols
 
-        # ✅ 线程安全：emit 前加锁复制
+            if scan_idx < batch_size:
+                print(f"🔄 {EXCHANGES[exchange]['name']}：已完成一轮全市场扫描")
+
+        scanning = False
+
+# ========== 切换交易所事件 ==========
+@socketio.on('switch_exchange')
+def handle_switch_exchange(data):
+    global current_exchange, scanning
+    exchange_id = data.get('exchange')
+    if exchange_id in EXCHANGES:
         with lock:
-            for sym, data in new_swing_this_round.items():
-                swing_symbols[sym] = data
-            prices_snapshot = prices.copy()
-            swings_snapshot = swing_symbols.copy()
+            current_exchange = exchange_id
+            scanning = False  # 停止当前扫描
+        print(f"🔄 切换至交易所: {EXCHANGES[exchange_id]['name']}")
 
-        socketio.emit('update_prices', prices_snapshot, namespace='/')
-        socketio.emit('update_swings', swings_snapshot, namespace='/')
-
-        scan_index = (scan_index + batch_size) % total_symbols
-
-        if scan_index < batch_size:
-            print(f"🔄 已完成一轮全市场扫描（共 {total_symbols} 个合约）")
-
-# ========== 自动打开浏览器（带异常处理）==========
+# ========== 自动打开浏览器 ==========
 def open_browser():
     try:
         webbrowser.open("http://localhost:5000", new=2)
     except Exception:
-        pass  # 忽略浏览器打不开的错误
+        pass
 
-# ========== Web 路由 ==========
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-# ========== HTML 模板（含按振幅降序排序）==========
-HTML_TEMPLATE = '''
+# ========== HTML 模板 ==========
+HTML_TEMPLATE = r'''
 <!DOCTYPE html>
 <html lang="zh">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OKX 全市场震荡扫描器</title>
+    <title>多交易所震荡扫描器</title>
     <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         body { background: #0f0f1b; color: #e0e0ff; padding: 20px; }
+        .header { text-align: center; margin-bottom: 20px; }
+        h1 { 
+            margin-bottom: 15px; 
+            font-size: 28px; 
+            color: var(--primary-color, #f39c12);
+            transition: color 0.3s;
+        }
+        .exchange-selector {
+            display: inline-block;
+            background: #1a1a2e;
+            padding: 10px 20px;
+            border-radius: 24px;
+            margin-bottom: 15px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        select {
+            background: #252540;
+            color: #e0e0ff;
+            border: 1px solid #444;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            outline: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a9a9ff' stroke-width='2'%3e%3cpath d='M6 9l6 6 6-6'/%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            background-size: 14px;
+            padding-right: 36px;
+        }
         .container { max-width: 1400px; margin: 0 auto; display: flex; gap: 20px; flex-wrap: wrap; }
         .panel { background: #1a1a2e; border-radius: 12px; padding: 20px; flex: 1; min-width: 300px; }
-        h1 { text-align: center; margin-bottom: 20px; color: #4cc9f0; font-size: 28px; }
         h2 { margin-bottom: 15px; color: #f72585; font-size: 20px; }
         .price-item { 
             display: flex; justify-content: space-between; 
@@ -212,16 +353,31 @@ HTML_TEMPLATE = '''
         .status { text-align: center; margin-top: 10px; color: #888; font-size: 0.9em; }
         .header-info { text-align: center; color: #aaa; margin-bottom: 15px; }
         .amplitude { color: #ffd166; font-weight: bold; }
+        .loading { color: #ffaa33; }
     </style>
 </head>
 <body>
-    <h1>🌐 OKX 全市场震荡扫描器</h1>
-    <div class="header-info">正在扫描全部 <span id="totalCount">--</span> 个永续合约 · 实时滚动更新</div>
+    <div class="header">
+        <h1 id="exchangeTitle">多交易所震荡扫描器</h1>
+        <div class="exchange-selector">
+            <select id="exchangeSelect">
+                <option value="binance">Binance</option>
+                <option value="okx">OKX</option>
+                <option value="bybit">Bybit</option>
+                <option value="bitget">Bitget</option>
+                <option value="kucoin">KuCoin Futures</option>
+            </select>
+        </div>
+        <div class="header-info">
+            正在扫描全部 <span id="totalCount">--</span> 个永续合约 · 
+            <span id="statusText" class="loading">加载中...</span>
+        </div>
+    </div>
+
     <div class="container">
         <div class="panel">
             <h2>📈 实时价格（全市场）</h2>
             <div id="prices"></div>
-            <div class="status">加载中...</div>
         </div>
         <div class="panel">
             <h2>🎯 震荡币种（三重过滤｜按振幅降序）</h2>
@@ -237,7 +393,8 @@ HTML_TEMPLATE = '''
         let totalCount = 0;
 
         function formatPrice(price) {
-            if (typeof price !== 'number' || isNaN(price)) return '--';
+            // 👇 安全处理 null / NaN / undefined
+            if (price == null || typeof price !== 'number' || isNaN(price)) return '--';
             if (price >= 1) return price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             return parseFloat(price).toFixed(8).replace(/\.?0+$/, '');
         }
@@ -269,7 +426,6 @@ HTML_TEMPLATE = '''
             const status = document.getElementById('swingStatus');
             container.innerHTML = '';
 
-            // 🔺 按平均振幅从大到小排序
             const sortedSwings = Object.entries(swings)
                 .sort((a, b) => b[1].amplitude - a[1].amplitude);
 
@@ -292,34 +448,63 @@ HTML_TEMPLATE = '''
             });
         }
 
+        function switchExchange(exchangeId) {
+            document.getElementById('statusText').textContent = '正在切换...';
+            document.getElementById('statusText').className = 'loading';
+            socket.emit('switch_exchange', { exchange: exchangeId });
+        }
+
+        document.getElementById('exchangeSelect').addEventListener('change', (e) => {
+            switchExchange(e.target.value);
+        });
+
         socket.on('connect', () => {
-            console.log('Connected to server');
+            console.log('✅ 已连接到服务器');
         });
 
         socket.on('update_prices', (data) => {
             prices = data;
             totalCount = Object.keys(data).length;
             updatePrices();
+            document.getElementById('statusText').textContent = '实时更新中';
+            document.getElementById('statusText').className = '';
         });
 
         socket.on('update_swings', (data) => {
             swings = data;
             updateSwings();
         });
+
+        socket.on('update_exchange', (data) => {
+            document.documentElement.style.setProperty('--primary-color', data.color);
+            document.getElementById('exchangeTitle').textContent = data.exchange + ' 震荡扫描器';
+        });
     </script>
 </body>
 </html>
 '''
 
-# ========== 启动 ==========
+# 👇 关键路由：解决 404
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+# ========== 启动主程序 ==========
 if __name__ == '__main__':
     scanner_thread = threading.Thread(target=background_scanner, daemon=True)
     scanner_thread.start()
     
-    # 启动后 1.5 秒自动打开浏览器
     browser_thread = threading.Thread(target=open_browser)
     browser_thread.daemon = True
     browser_thread.start()
     
-    print("🚀 OKX 扫描器已启动，正在打开浏览器...")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    print("🚀 多交易所震荡扫描器已启动，正在打开浏览器...")
+    print("支持的交易所：Binance, OKX, Bybit, Bitget, KuCoin Futures")
+    socketio.run(
+        app,
+        host='127.0.0.1',
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True  # 允许本地运行（新版 Flask-SocketIO 必需）
+    )
